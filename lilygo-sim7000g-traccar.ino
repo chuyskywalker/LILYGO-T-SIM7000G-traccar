@@ -1,4 +1,18 @@
 /* 
+
+An absurdly simple GPS tracker based on the LILYGO T-SIM7000G
+
+Reports very quickly (10s) and if you send the custom command "boost" 
+will report, basically, as fast as possible.
+
+I desoldered the battery tray; I simply could not find a reason to 
+keep it on, plus the way power worked on the board between usb vs 
+solar charge I just wasn't happy with any of the setups available. 
+
+So I decided to just drop it and only have GPS reporting when the 
+unit has power, which is fine for me. Slims up the overall profile
+quite a bit.
+
 Based on many sources, including:
  - https://RandomNerdTutorials.com/lilygo-t-sim7000g-esp32-lte-gprs-gps/
  - https://randomnerdtutorials.com/lilygo-t-sim7000g-esp32-gps-data/
@@ -18,259 +32,84 @@ Based on many sources, including:
 
 #define TINY_GSM_MODEM_SIM7000
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
-#define SerialAT Serial1
 
-// Your GPRS credentials, if any
-const char apn[]  = "XXXXXX";     // SET TO YOUR APN
-const char gprsUser[] = "";
-const char gprsPass[] = "";
+#include "config.h"
 
 #include <TinyGsmClient.h>
 #include <ArduinoHttpClient.h>
 #include <UrlEncode.h>
 #include <TimeLib.h>
 
-// See all AT commands, if wanted
-// #define DUMP_AT_COMMANDS
-
-#ifdef DUMP_AT_COMMANDS  // if enabled it requires the streamDebugger lib
-  #include <StreamDebugger.h>
-  StreamDebugger debugger(SerialAT, Serial);
-  TinyGsm modem(debugger);
-#else
-  TinyGsm modem(SerialAT);
-#endif
+TinyGsm modem(Serial1);
 
 TinyGsmClient client(modem);
+HttpClient http(client, traccar_server, traccar_port);
 
-const char server[] = "XXXXXXX"; // traccar installation ip address
-const int port = 5055;
+#define UART_BAUD 115200
+#define PIN_DTR 25 // reset pin, maybe? Not sure
+#define PIN_TX 27
+#define PIN_RX 26
+#define PWR_PIN 4
 
-HttpClient http(client, server, port);
+#define LED_PIN 12
 
-#define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
-#define TIME_TO_SLEEP  60          // Time ESP32 will go to sleep (in seconds)
+uint loopRateNormal = 15000; // 10 seconds
+uint loopRateBoost  =  1000; // very fast, every 1 seconds
+uint loopRate = loopRateNormal;
 
-#define UART_BAUD   115200
-#define PIN_DTR     25
-#define PIN_TX      27
-#define PIN_RX      26
-#define PWR_PIN     4
+uint postFailures = 0;
+uint modemFailures = 0;
+uint maxPostFailures = 5;
+uint maxModemFailures = 5;
 
-#define SD_MISO     2
-#define SD_MOSI     15
-#define SD_SCLK     14
-#define SD_CS       13
-#define LED_PIN     12
-#define BAT_ADC     35
-
-int counter, lastIndex, numberOfPieces = 24;
-String pieces[24], input;
-
-// LILYGO T-SIM7000G
-// https://github.com/Xinyuan-LilyGO/LilyGO-T-SIM7000G/blob/master/examples/readBattery/readBattery.ino
-float ReadBattery()
-{
-  int vref = 1100;
-  uint16_t volt = analogRead(BAT_ADC);
-  return ((float)volt / 4095.0) * 2.0 * 3.3 * (vref/1000);
-}
-
-void setup(){
-  // Set console baud rate
-  Serial.begin(115200);
-  delay(100);
-
-  Serial.println("--- Starting up");
-
-  // Set LED OFF
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
-
-  Serial.println("--- Toggle modem pin");
+void modemPowerOn() {
+  Serial.println("turn on modem");
   pinMode(PWR_PIN, OUTPUT);
-  digitalWrite(PWR_PIN, HIGH);
-  // Starting the machine requires at least 1 second of low level, and with a level conversion, the levels are opposite
-  delay(1000);
   digitalWrite(PWR_PIN, LOW);
-
-  Serial.println("--- Give modem boot time");
-  delay(1000);
-
-  Serial.println("--- Open modem serial connection");
-  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
-
-  // Restart takes quite some time
-  // To skip it, call init() instead of restart()
-  Serial.println("--- Initializing modem...");
-  if (!modem.restart()) {
-    Serial.println("--- Failed to restart modem, continue anyway");
-  }
+  delay(1000); // Datasheet Ton mintues = 1S
+  digitalWrite(PWR_PIN, HIGH);
+  delay(10000); // give the modem 10 seconds to have its coffee
+  Serial.println("...on");
 }
 
-void loop(){
+void modemPowerOff() {
+  Serial.println("turn off modem");
+  pinMode(PWR_PIN, OUTPUT);
+  digitalWrite(PWR_PIN, LOW);
+  delay(1500); // Datasheet Ton mintues = 1.2S
+  digitalWrite(PWR_PIN, HIGH);
+  Serial.println("...off");
+}
 
-  Serial.println("--- Initializing modem...");
-  if (!modem.init()) {
-    Serial.println("--- Failed to initialize modem, looping");
-    delay(1000);
-    return;
-  }
+void modemRestart() {
+  Serial.println("Restart modem");
+  modemPowerOff();
+  modemPowerOn();
+  Serial.println("...restarted");
+}
 
-  // CFUN=0 == reset to basic functionality
-  Serial.println("--- CFUN=0; Reset modem to basic functionality");
-  modem.sendAT("+CFUN=0");
-  if (modem.waitResponse(10000L) != 1) {
-    DBG(" +CFUN=0  false ");
-  }
-  delay(200);
-
-  Serial.println("--- Set networkmode");
-  /*
-    2 Automatic
-    13 GSM only
-    38 LTE only
-    51 GSM and LTE only
-  * * * */
-  String res;
-  // CHANGE NETWORK MODE, IF NEEDED
-  res = modem.setNetworkMode(51);  // customize as needed
-  if (res != "1") {
-    DBG("setNetworkMode  false ");
-    return ;
-  }
-  delay(200);
-
-  Serial.println("--- Set preferredmode");
-  /*
-    1 CAT-M
-    2 NB-Iot
-    3 CAT-M and NB-IoT
-  * * */
-  // CHANGE PREFERRED MODE, IF NEEDED
-  res = modem.setPreferredMode(2);  // customize as needed
-  if (res != "1") {
-    DBG("setPreferredMode  false ");
-    return ;
-  }
-  delay(200);
-
-  Serial.println("--- CFUN=1; all functionality back on");
-  modem.sendAT("+CFUN=1");
-  if (modem.waitResponse(10000L) != 1) {
-    DBG(" +CFUN=1  false ");
-  }
-  delay(200);
-
-  // todo: what in the blazes is this section doing?
-  Serial.println("--- CGDCONT PDP...thing");
-  SerialAT.println("AT+CGDCONT?");
-  delay(500);
-  if (SerialAT.available()) {
-    input = SerialAT.readString();
-    for (int i = 0; i < input.length(); i++) {
-      if (input.substring(i, i + 1) == "\n") {
-        pieces[counter] = input.substring(lastIndex, i);
-        lastIndex = i + 1;
-        counter++;
-       }
-        if (i == input.length() - 1) {
-          pieces[counter] = input.substring(lastIndex, i);
-        }
-      }
-      // Reset for reuse
-      input = "";
-      counter = 0;
-      lastIndex = 0;
-
-      for ( int y = 0; y < numberOfPieces; y++) {
-        for ( int x = 0; x < pieces[y].length(); x++) {
-          char c = pieces[y][x];  //gets one byte from buffer
-          if (c == ',') {
-            if (input.indexOf(": ") >= 0) {
-              String data = input.substring((input.indexOf(": ") + 1));
-              if ( data.toInt() > 0 && data.toInt() < 25) {
-                modem.sendAT("+CGDCONT=" + String(data.toInt()) + ",\"IP\",\"" + String(apn) + "\",\"0.0.0.0\",0,0,0,0");
-              }
-              input = "";
-              break;
-            }
-          // Reset for reuse
-          input = "";
-         } else {
-          input += c;
-         }
-      }
-    }
-  } else {
-    Serial.println("Failed to get PDP!");
-  }
-
-  Serial.println("--- Waiting for network...");
-  if (!modem.waitForNetwork()) {
-    Serial.println("--- Wait failed, restart loop");
-    delay(1000);
-    return;
-  }
-
-  if (modem.isNetworkConnected()) {
-    Serial.println("--- Network connected");
-  }
-  
-  Serial.println("--- Connecting to GPRS with APN: " + String(apn));
-  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
-    Serial.println("--- GPRS connect failed, looping");
-    delay(1000);
-    return;
-  }
-
-  Serial.print("--- GPRS status: ");
-  if (modem.isGprsConnected()) {
-    Serial.println("connected");
-  } else {
-    Serial.println("not connected");
-    delay(1000);
-    return;
-  }
-
-  Serial.println("--- Power on the GPS");
-  // Set SIM7000G GPIO4 HIGH ,turn on GPS power
-  // CMD:AT+SGPIO=0,4,1,1
-  // Only in version 20200415 is there a function to control GPS power
+void enableGPS(void) {
   modem.sendAT("+SGPIO=0,4,1,1");
-  if (modem.waitResponse(10000L) != 1) {
+  if (modem.waitResponse(10000L) != 1)
+  {
     DBG(" SGPIO=0,4,1,1 false ");
   }
   modem.enableGPS();
-  
-  int nowYear, nowMonth, nowDay, nowHour, nowMinute, nowSecond, usat = 0, vsat = 0;
-  float gpsLatitude = 0, gpsLongitude = 0, gpsSpeed = 0,  gpsAltitude = 0, gpsAccuracy = 0, battery = 0;
+}
 
-  Serial.println("--- Fetching GPS location after lock");
-  while (1) {
-    if (modem.getGPS(&gpsLatitude, &gpsLongitude, &gpsSpeed, &gpsAltitude, &vsat, &usat, &gpsAccuracy, &nowYear, &nowMonth, &nowDay, &nowHour, &nowMinute, &nowSecond)) {
-      Serial.printf("--- got gps data: lat:%f lon:%f\n", gpsLatitude, gpsLongitude);
-      break;
-    } else {
-      Serial.print("--- awaiting lock, ms:");
-      Serial.println(millis());
-    }
-    delay(2000);
-  }
-  modem.disableGPS();
-
-  Serial.println("--- Turning off GPS power");
-  // Set SIM7000G GPIO4 LOW ,turn off GPS power
-  // CMD:AT+SGPIO=0,4,1,0
-  // Only in version 20200415 is there a function to control GPS power
+void disableGPS(void) {
   modem.sendAT("+SGPIO=0,4,1,0");
-  if (modem.waitResponse(10000L) != 1) {
+  if (modem.waitResponse(10000L) != 1)
+  {
     DBG(" SGPIO=0,4,1,0 false ");
   }
-  Serial.println("--- GPS turned off");
+  modem.disableGPS();
+}
 
+int nowYear, nowMonth, nowDay, nowHour, nowMinute, nowSecond, usat = 0, vsat = 0;
+float gpsLatitude = 0, gpsLongitude = 0, gpsSpeed = 0,  gpsAltitude = 0, gpsAccuracy = 0;
 
-  Serial.println("--- Send Coords");
+void send_data() {
 
   tmElements_t my_time;  // time elements structure
   time_t unix_timestamp; // a timestamp
@@ -285,82 +124,172 @@ void loop(){
 
   unix_timestamp = makeTime(my_time);
 
-  // get the battery voltage, to report back
-  battery = ReadBattery();
+  // compile the url
+  String url = "/?id=" + urlEncode(modem.getIMEI())
+             + "&lat=" + urlEncode(String(gpsLatitude, 6))
+             + "&lon=" + urlEncode(String(gpsLongitude, 6))
+             + "&speed=" + urlEncode(String(gpsSpeed))
+             + "&altitude=" + urlEncode(String(gpsAltitude))
+             + "&accuracy=" + urlEncode(String(gpsAccuracy))
+             + "&satVisible=" + urlEncode(String(vsat)) // Visible Satellites
+             + "&sat=" + urlEncode(String(usat)) // Used Satellites
+             + "&timestamp=" + urlEncode(String(unix_timestamp))
+             + "&batteryLevel=100&charge=true" // I desoldered the battery, sooo
+             + "";
 
-  // experimental version (i'm pretty sure this one doesn't really work)
-  uint8_t  chargeState = -99;
-  int8_t   percent     = -99;
-  uint16_t milliVolts  = -9999;
-  modem.getBattStats(chargeState, percent, milliVolts);
+  Serial.print(F("GPS POST: "));
+  Serial.println(url);
 
-  String GpsData = "id=" + urlEncode(modem.getIMEI())
-                 + "&lat=" + urlEncode(String(gpsLatitude, 6))
-                 + "&lon=" + urlEncode(String(gpsLongitude, 6))
-                 + "&speed=" + urlEncode(String(gpsSpeed))
-                 + "&altitude=" + urlEncode(String(gpsAltitude))
-                 + "&accuracy=" + urlEncode(String(gpsAccuracy))
-                 + "&satVisible=" + urlEncode(String(vsat)) // Visible Satellites
-                 + "&sat=" + urlEncode(String(usat)) // Used Satellites
-                 + "&timestamp=" + urlEncode((String)unix_timestamp)
-                 + "&battery=" + urlEncode(String(battery, 4))
-                 + "&xbatstate=" + urlEncode(String(chargeState))
-                 + "&xbatpercent=" + urlEncode(String(percent))
-                 + "&xbatvolts=" + urlEncode(String(milliVolts, 4))
-                 ;
-  
-  Serial.write("--- GPS Data: ");
-  Serial.println(GpsData);
-
-  Serial.println("--- POST data");
-  int err = http.post("/?" + GpsData);
+  int err = http.post(url);
   if (err != 0) {
-    Serial.println("--- failed to post data");
+    Serial.println(F("...failed to connect: "));
     Serial.println(err);
+    postFailures++;
+    return;
   }
 
   int status = http.responseStatusCode();
   if (!status) {
-    Serial.println("--- Bogus response code:");
+    Serial.println(F("...failed to submit: "));
     Serial.println(status);
+    postFailures++;
+    return;
   }
-
+  
+  // grab any response content; may be a command present
   String body = http.responseBody();
-  Serial.println("--- Response:");
-  Serial.println(body);
+  if (body != "") {
+    Serial.println(F("Response:"));
+    Serial.println(body);
+    Serial.println(F("/EOF Response"));
 
-  // close the connection
-  http.stop();
-  Serial.println("--- GPS Data submitted");
+    if (body == "boost") {
+      Serial.println(F("CMD 'boost' -- Boosting reporting rate"));
+      loopRate = loopRateBoost;
+    } else if (body == "endboost") {
+      Serial.println(F("CMD 'endboost' -- Returning to normal reporting rate"));
+      loopRate = loopRateNormal;
+    } else {
+      Serial.println(F("No such command; no effect"));
+    }
 
+    // String loopRateCommand = "loopRate=";
+    // uint cmdLen = loopRateCommand.length();
+    // if (body.startsWith(loopRateCommand) && body.length() > cmdLen) {
+    //   String nextRate = body.substring(cmdLen);
+    //   int nextRateVal = nextRate.toInt();
+    //   if (nextRateVal != 0) {
+    //     Serial.println(F("Change loop rate to:"));
+    //     Serial.println(nextRate);
+    //     loopRate = nextRateVal;
+    //   } else {
+    //     Serial.println(F("Got loopRate with bogus data:"));
+    //     Serial.println(nextRate);
+    //   }
+    // }
 
-  Serial.println("--- GPRS disconnecting");
-  modem.gprsDisconnect();
-  if (!modem.isGprsConnected()) {
-    Serial.println("--- GPRS disconnected");
   } else {
-    Serial.println("--- GPRS disconnect: Failed.");
+    Serial.println(F("Response empty"));
   }
 
-  // --------TESTING POWER DONW--------
-  Serial.println("--- Entering power down state");
+  // Shutdown
+  http.stop();
+  postFailures = 0;
+  Serial.println(F("...posted"));
+}
 
-  // Try to power-off (modem may decide to restart automatically)
-  // To turn off modem completely, please use Reset/Enable pins
-  modem.sendAT("+CPOWD=1");
-  if (modem.waitResponse(10000L) != 1) {
-    DBG("+CPOWD=1");
+void setup()
+{
+  // Set console baud rate
+  Serial.begin(115200);
+  delay(100);
+  
+  Serial.println("setup()");
+
+  // Set LED OFF
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  // set modem bause rate and connection details
+  Serial1.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+  delay(100);
+
+  modemPowerOn();
+
+  Serial.println("...end setup()");
+
+}
+
+void loop()
+{
+  Serial.println(F("loop()"));
+
+  if (modemFailures >= maxModemFailures) {
+    Serial.println(F("too many modem failures, resetting"));
+    disableGPS();
+    modemRestart();
+    modemFailures = 0;
+    Serial.println(F("...reset complete"));
   }
-  // The following command does the same as the previous lines
-  modem.poweroff();
 
-  // GO TO SLEEP
-  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-  delay(200);
-  esp_deep_sleep_start();
-
-  // Do nothing forevermore
-  while (true) {
-      modem.maintain();
+  if (!modem.isNetworkConnected()) {
+    Serial.println(F("Not connected, running a modem restart"));
+    if (!modem.restart()) {
+      Serial.println(F("...failed"));
+      modemFailures++;
+      delay(1000);
+      return;
+    }
+    Serial.println(F("...restarted"));
   }
+  
+  Serial.println(F("Awaiting network"));
+  if (!modem.waitForNetwork(600000L)) {
+    Serial.println(F("...failed"));
+    modemFailures++;
+    delay(1000);
+    return;
+  }
+  Serial.println(F("...network ready"));
+
+  // Establish GPRS (data/tcp/etc) connection, as needed
+  if (!modem.isGprsConnected()) {
+    Serial.print(F("Connecting to APN: "));
+    Serial.println(apn);
+    if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+      Serial.println(F("...failed"));
+      modemFailures++;
+      delay(1000);
+      return;
+    }
+    Serial.println(F("...success"));
+  }
+  Serial.println(F("GPRS Ready"));
+
+  // turn on gps now that modem is running and GPRS is up (which needs to happen first, apparently?)
+  enableGPS();
+
+  Serial.println("Lock and fetch GPS location");
+  // todo: perhaps wait till accuracy is high enough? enough usat's?
+  while (1) {
+    if (modem.getGPS(&gpsLatitude, &gpsLongitude, &gpsSpeed, &gpsAltitude, &vsat, &usat, &gpsAccuracy, &nowYear, &nowMonth, &nowDay, &nowHour, &nowMinute, &nowSecond)) {
+      if (gpsLatitude == 0 && gpsLongitude == 0) {
+        Serial.print("what the hell lat/long @ 0? No. Bogus data; do not submit; full reset");
+        modemFailures = maxModemFailures; // will cause a modem power cycle on next loop()
+        break; // breaks the while, allowing for the next loop()
+      } else {
+        send_data();
+      }
+      delay(loopRate);
+    } else {
+      Serial.print("awaiting lock, ms:");
+      Serial.println(millis());
+      delay(2000);
+    }
+    if (postFailures >= maxPostFailures) {
+      Serial.println("post failures high, restarting loop");
+      break;
+    }
+  }
+
 }
