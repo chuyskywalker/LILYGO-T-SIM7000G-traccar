@@ -1,49 +1,46 @@
-/* 
+/*
 
-An absurdly simple GPS tracker based on the LILYGO T-SIM7000G
+Tracker - ESP32 GPS Location Tracker w/ Traccar Integration
 
-Reports very quickly (10s) and if you send the custom command "boost" 
-will report, basically, as fast as possible.
+Setup a Traccar instance, populate the `config.h` file,
+pop in your sim, and you're off to the races.
 
-I desoldered the battery tray; I simply could not find a reason to 
-keep it on, plus the way power worked on the board between usb vs 
-solar charge I just wasn't happy with any of the setups available. 
+This project is based on a LILYGO T-SIM7000G. While it's a
+nice all-in-one solution, as I intended to put this in a
+vehicle, I didn't want to put in the effort to make the
+battery sub-system work. Frankly, it has some off behaviors
+anyway, which make it troublesome to work with.
 
-So I decided to just drop it and only have GPS reporting when the 
-unit has power, which is fine for me. Slims up the overall profile
-quite a bit.
+As such, this is a pretty basic "turn on, report rather fast"
+type approach. The idea is that you plug it into a cars 12v
+active system (with a step down converter) and when the car
+turns on, this starts tracking.
 
-Based on many sources, including:
- - https://RandomNerdTutorials.com/lilygo-t-sim7000g-esp32-lte-gprs-gps/
- - https://randomnerdtutorials.com/lilygo-t-sim7000g-esp32-gps-data/
- - https://github.com/Xinyuan-LilyGO/LilyGO-T-SIM7000G
- - https://github.com/Xinyuan-LilyGO/LilyGO-T-SIM7000G/blob/master/examples/Arduino_TinyGSM/AllFunctions/AllFunctions.ino
- - https://github.com/Xinyuan-LilyGO/LilyGO-T-SIM7000G/blob/master/examples/Arduino_NetworkTest/Arduino_NetworkTest.ino
- - https://github.com/Xinyuan-LilyGO/LilyGO-T-SIM7000G/blob/master/Historical/SIM7000G_20200415/README.MD
- - https://cdn.geekfactory.mx/sim7000g/SIM7000%20Series_AT%20Command%20Manual_V1.06.pdf
- - https://www.amazon.com/dp/B07JCTZ3BF
- - https://www.amazon.com/gp/product/B099RQ7BSR
- - https://github.com/onlinegill/LILYGO-TTGO-T-SIM7000G-ESP32-Traccar-GPS-tracker/blob/main/traccar.ino
- - https://github.com/htotoo/TCarTrackerSim/blob/main/esp32_car_github.ino
- - https://github.com/traccar/traccar/blob/master/src/main/java/org/traccar/protocol/OsmAndProtocolDecoder.java
- - https://github.com/traccar/traccar/blob/master/src/main/java/org/traccar/model/Position.java#L27
- - https://github.com/Xinyuan-LilyGO/LilyGO-T-SIM7000G/issues/81
- */
+This sketch also includes support for outputting to an oled
+screen so you can get an idea of the operational state of
+the device. I used the SSD1322 type screen.
+
+I originally built this with the OSMAND protocol and
+ArduinoHttpClient, but I had enormous trouble getting that
+to work without timeouts measured in minutes and > 10%
+failure-to-report rates. Swapping to a TCP protocol has
+proven far more reliable.
+
+*/
 
 #define TINY_GSM_MODEM_SIM7000
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
 
-#include "config.h"
-
 #include <TinyGsmClient.h>
-#include <ArduinoHttpClient.h>
-#include <UrlEncode.h>
-#include <TimeLib.h>
+#include <Arduino.h>
+#include <WiFi.h>
+
+// #include <StreamDebugger.h>
+// StreamDebugger debugger(Serial1, Serial);
+// TinyGsm modem(debugger);
 
 TinyGsm modem(Serial1);
-
 TinyGsmClient client(modem);
-HttpClient http(client, traccar_server, traccar_port);
 
 #define UART_BAUD 115200
 #define PIN_DTR 25 // reset pin, maybe? Not sure
@@ -51,245 +48,302 @@ HttpClient http(client, traccar_server, traccar_port);
 #define PIN_RX 26
 #define PWR_PIN 4
 
-#define LED_PIN 12
+#include "config.h";
 
-uint loopRateNormal = 15000; // 10 seconds
-uint loopRateBoost  =  1000; // very fast, every 1 seconds
-uint loopRate = loopRateNormal;
+#include <U8x8lib.h>
 
-uint postFailures = 0;
-uint modemFailures = 0;
-uint maxPostFailures = 5;
-uint maxModemFailures = 5;
+U8X8_SSD1322_NHD_256X64_4W_SW_SPI u8x8(/* clock=*/ 18, /* data=*/ 19, /* cs=*/ 5, /* dc=*/ 22, /* reset=*/ 21);
+
+// screen properties
+struct screen {
+  String imei = "";
+  bool hasNetwork = false;
+  bool hasGPRS = false;
+  bool hasGPS = false;
+  bool hasTCP = false;
+  String lastTime = "????/??/?? ??:??:??";
+  float lastLat = 0;
+  float lastLon = 0;
+  int submissionCount = 0;
+};
+
+screen screenInfo;
+
+#define SECS_PER_MIN  (60UL)
+#define SECS_PER_HOUR (3600UL)
+#define numberOfSeconds(_time_) (_time_ % SECS_PER_MIN)  
+#define numberOfMinutes(_time_) ((_time_ / SECS_PER_MIN) % SECS_PER_MIN) 
+#define numberOfHours(_time_) (( _time_ / SECS_PER_HOUR) % SECS_PER_HOUR) 
+
+void screenDraw(void * pvParameters) {
+  bool first = false;
+  while(1) {
+
+    if (!first) {
+      // turn on the screen
+      u8x8.begin();
+      delay(100);
+
+      u8x8.setFont(u8x8_font_px437wyse700a_2x2_r);
+      u8x8.drawString(0, 0, "Tracker");
+      u8x8.setFont(u8x8_font_chroma48medium8_r);
+      u8x8.drawString(32-6, 1, "LTE: ");
+      u8x8.drawString(32-7, 2, "GPRS: ");
+      u8x8.drawString(32-6, 3, "GPS: ");
+      u8x8.drawString(32-6, 4, "TCP: ");
+      u8x8.drawString(0, 2, "IMEI: ");
+      u8x8.drawString(0, 4, "Last Report:");
+      first = true;
+    }
+
+    long val = millis() / 1000;
+    
+    int hours   = numberOfHours(val);
+    int minutes = numberOfMinutes(val);
+    int seconds = numberOfSeconds(val);
+
+    String dhms = pad(hours) + ":" + pad(minutes) + ":" + pad(seconds);
+    u8x8.drawString(15, 1, dhms.c_str());
+
+    String subs_count = "Subs: " + String(screenInfo.submissionCount);
+    u8x8.drawString(32-subs_count.length(), 0, subs_count.c_str());
+    
+    u8x8.drawString(32-1, 1, screenInfo.hasNetwork ? "Y" : "N");
+    u8x8.drawString(32-1, 2, screenInfo.hasGPRS ? "Y" : "N");
+    u8x8.drawString(32-1, 3, screenInfo.hasGPS ? "Y" : "N");
+    u8x8.drawString(32-1, 4, screenInfo.hasTCP ? "Y" : "N"); 
+
+    u8x8.drawString(2, 5, screenInfo.lastTime.c_str());
+
+    String lastlatlon = String(screenInfo.lastLat, 6) + " / " + String(screenInfo.lastLon, 6);
+    u8x8.drawString(2, 6, lastlatlon.c_str());
+    
+    u8x8.drawString(6, 2, screenInfo.imei == "" ? "Unknown" : screenInfo.imei.c_str());
+
+    delay(200);
+  }
+}
 
 void modemPowerOn() {
   Serial.println("turn on modem");
   pinMode(PWR_PIN, OUTPUT);
-  digitalWrite(PWR_PIN, LOW);
+  digitalWrite(PWR_PIN, HIGH);
   delay(1000); // Datasheet Ton mintues = 1S
-  digitalWrite(PWR_PIN, HIGH);
-  delay(10000); // give the modem 10 seconds to have its coffee
-  Serial.println("...on");
-}
-
-void modemPowerOff() {
-  Serial.println("turn off modem");
-  pinMode(PWR_PIN, OUTPUT);
   digitalWrite(PWR_PIN, LOW);
-  delay(1500); // Datasheet Ton mintues = 1.2S
-  digitalWrite(PWR_PIN, HIGH);
-  Serial.println("...off");
-}
-
-void modemRestart() {
-  Serial.println("Restart modem");
-  modemPowerOff();
-  modemPowerOn();
-  Serial.println("...restarted");
+  Serial.println("> on");
+  delay(10000); // give the modem 10 seconds to have its coffee
+  Serial.println("> ready");
 }
 
 void enableGPS(void) {
-  modem.sendAT("+SGPIO=0,4,1,1");
-  if (modem.waitResponse(10000L) != 1)
-  {
-    DBG(" SGPIO=0,4,1,1 false ");
-  }
-  modem.enableGPS();
-}
-
-void disableGPS(void) {
-  modem.sendAT("+SGPIO=0,4,1,0");
-  if (modem.waitResponse(10000L) != 1)
-  {
-    DBG(" SGPIO=0,4,1,0 false ");
-  }
-  modem.disableGPS();
-}
-
-int nowYear, nowMonth, nowDay, nowHour, nowMinute, nowSecond, usat = 0, vsat = 0;
-float gpsLatitude = 0, gpsLongitude = 0, gpsSpeed = 0,  gpsAltitude = 0, gpsAccuracy = 0;
-
-void send_data() {
-
-  tmElements_t my_time;  // time elements structure
-  time_t unix_timestamp; // a timestamp
-
-  // convert the GPS date and time (which is in UTC) into unix time, offset 1970
-  my_time.Second = nowSecond;
-  my_time.Hour   = nowHour;
-  my_time.Minute = nowMinute;
-  my_time.Day    = nowDay;
-  my_time.Month  = nowMonth;                // sometimes (months start from 0, so deduct 1) but in this case, nope
-  my_time.Year   = CalendarYrToTm(nowYear); // years since 1970, so deduct 1970
-
-  unix_timestamp = makeTime(my_time);
-
-  // compile the url
-  String url = "/?id=" + urlEncode(modem.getIMEI())
-             + "&lat=" + urlEncode(String(gpsLatitude, 6))
-             + "&lon=" + urlEncode(String(gpsLongitude, 6))
-             + "&speed=" + urlEncode(String(gpsSpeed))
-             + "&altitude=" + urlEncode(String(gpsAltitude))
-             + "&accuracy=" + urlEncode(String(gpsAccuracy))
-             + "&satVisible=" + urlEncode(String(vsat)) // Visible Satellites
-             + "&sat=" + urlEncode(String(usat)) // Used Satellites
-             + "&timestamp=" + urlEncode(String(unix_timestamp))
-             + "&batteryLevel=100&charge=true" // I desoldered the battery, sooo
-             + "";
-
-  Serial.print(F("GPS POST: "));
-  Serial.println(url);
-
-  int err = http.post(url);
-  if (err != 0) {
-    Serial.println(F("...failed to connect: "));
-    Serial.println(err);
-    postFailures++;
-    return;
-  }
-
-  int status = http.responseStatusCode();
-  if (!status) {
-    Serial.println(F("...failed to submit: "));
-    Serial.println(status);
-    postFailures++;
-    return;
-  }
-  
-  // grab any response content; may be a command present
-  String body = http.responseBody();
-  if (body != "") {
-    Serial.println(F("Response:"));
-    Serial.println(body);
-    Serial.println(F("/EOF Response"));
-
-    if (body == "boost") {
-      Serial.println(F("CMD 'boost' -- Boosting reporting rate"));
-      loopRate = loopRateBoost;
-    } else if (body == "endboost") {
-      Serial.println(F("CMD 'endboost' -- Returning to normal reporting rate"));
-      loopRate = loopRateNormal;
-    } else {
-      Serial.println(F("No such command; no effect"));
-    }
-
-    // String loopRateCommand = "loopRate=";
-    // uint cmdLen = loopRateCommand.length();
-    // if (body.startsWith(loopRateCommand) && body.length() > cmdLen) {
-    //   String nextRate = body.substring(cmdLen);
-    //   int nextRateVal = nextRate.toInt();
-    //   if (nextRateVal != 0) {
-    //     Serial.println(F("Change loop rate to:"));
-    //     Serial.println(nextRate);
-    //     loopRate = nextRateVal;
-    //   } else {
-    //     Serial.println(F("Got loopRate with bogus data:"));
-    //     Serial.println(nextRate);
-    //   }
-    // }
-
+  modem.sendAT("+CGPIO=0,48,1,1");
+  if (modem.waitResponse(10000L) == 1) {
+    Serial.println("Set GPS Power pin HIGH");
   } else {
-    Serial.println(F("Response empty"));
+    Serial.println("Set GPS Power pin HIGH FAILED");
   }
-
-  // Shutdown
-  http.stop();
-  postFailures = 0;
-  Serial.println(F("...posted"));
+  if (modem.enableGPS()) {
+    Serial.println("GPS turned on via AT");
+  } else {
+    Serial.println("GPS turned on via AT FAILED");
+  }
+  modem.sendAT("+CGNSHOR=10 ");
+  if (modem.waitResponse(10000L) == 1) {
+    Serial.println("GPS set to 10m resolution");
+  } else {
+    Serial.println("GPS set to 10m resolution FAILED");
+  }
+  Serial.println("> GPS Enabled");
 }
 
-void setup()
-{
+void setup() {
   // Set console baud rate
   Serial.begin(115200);
-  delay(100);
-  
+  delay(1000);
+
   Serial.println("setup()");
 
-  // Set LED OFF
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
+  // turn off wifi & bluetooth to save power, I guess...
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  btStop();
 
   // set modem bause rate and connection details
   Serial1.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
   delay(100);
 
+  // start screen drawing thread
+  // NOTE: Do all screen operations in thread; I'm pretty sure 
+  //       the screen goes haywire if the two threads try to 
+  //       write at the same time.
+  xTaskCreatePinnedToCore(
+    screenDraw,         /* Task function. */
+    "screen",           /* name of task. */
+    10000,              /* Stack size of task */
+    NULL,               /* parameter of the task */
+    1,                  /* priority of the task */
+    NULL,               /* Task handle to keep track of created task */
+    0);                 /* pin task to core 0 */
+
+  // give it the juice
   modemPowerOn();
 
-  Serial.println("...end setup()");
+  // Always run a restart; sometimes modem connection from last build gets stuck
+  modem.restart();
+
+  Serial.println("> end setup()");
 
 }
 
-void loop()
-{
-  Serial.println(F("loop()"));
-
-  if (modemFailures >= maxModemFailures) {
-    Serial.println(F("too many modem failures, resetting"));
-    disableGPS();
-    modemRestart();
-    modemFailures = 0;
-    Serial.println(F("...reset complete"));
+// sprintf? never heard of it...
+String pad(int val) {
+  if (val < 10) {
+    return "0" + String(val);
   }
+  return String(val);
+}
+
+int nowYear, nowMonth, nowDay, nowHour, nowMinute, nowSecond, usat = 0, vsat = 0;
+float gpsLatitude = 0, gpsLongitude = 0, gpsSpeed = 0,  gpsAltitude = 0, gpsAccuracy = 0;
+
+void loop() {
 
   if (!modem.isNetworkConnected()) {
-    Serial.println(F("Not connected, running a modem restart"));
+    screenInfo.hasNetwork = false;
+    Serial.println(F("Not connected, restarting modem"));
     if (!modem.restart()) {
-      Serial.println(F("...failed"));
-      modemFailures++;
+      Serial.println(F("> failed"));
       delay(1000);
       return;
     }
-    Serial.println(F("...restarted"));
+    Serial.println(F("> restarted"));
   }
-  
+
+  // wait for, like, useful shit
   Serial.println(F("Awaiting network"));
   if (!modem.waitForNetwork(600000L)) {
-    Serial.println(F("...failed"));
-    modemFailures++;
+    Serial.println(F("> failed"));
+    screenInfo.hasNetwork = false;
     delay(1000);
     return;
   }
-  Serial.println(F("...network ready"));
+  screenInfo.hasNetwork = true;
+  Serial.println(F("> network ready"));
 
   // Establish GPRS (data/tcp/etc) connection, as needed
   if (!modem.isGprsConnected()) {
-    Serial.print(F("Connecting to APN: "));
-    Serial.println(apn);
-    if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
-      Serial.println(F("...failed"));
-      modemFailures++;
+    screenInfo.hasGPRS = false;
+    Serial.println(F("Connecting to APN"));
+    if (!modem.gprsConnect("wholesale", "", "")) {
+      Serial.println(F("> failed"));
       delay(1000);
       return;
     }
-    Serial.println(F("...success"));
+    Serial.println(F("> success"));
   }
+  screenInfo.hasGPRS = true;
   Serial.println(F("GPRS Ready"));
 
-  // turn on gps now that modem is running and GPRS is up (which needs to happen first, apparently?)
+  // locate a meeee
   enableGPS();
 
-  Serial.println("Lock and fetch GPS location");
-  // todo: perhaps wait till accuracy is high enough? enough usat's?
-  while (1) {
-    if (modem.getGPS(&gpsLatitude, &gpsLongitude, &gpsSpeed, &gpsAltitude, &vsat, &usat, &gpsAccuracy, &nowYear, &nowMonth, &nowDay, &nowHour, &nowMinute, &nowSecond)) {
-      if (gpsLatitude == 0 && gpsLongitude == 0) {
-        Serial.print("what the hell lat/long @ 0? No. Bogus data; do not submit; full reset");
-        modemFailures = maxModemFailures; // will cause a modem power cycle on next loop()
-        break; // breaks the while, allowing for the next loop()
-      } else {
-        send_data();
-      }
-      delay(loopRate);
-    } else {
-      Serial.print("awaiting lock, ms:");
-      Serial.println(millis());
-      delay(2000);
+  // lets gooooo
+  Serial.println(F("Lock and fetch GPS location"));
+  
+  while(1) {
+    delay(15000);
+    
+    if (screenInfo.imei == "") {
+      Serial.print(F("Updating IMEI, now:"));
+      screenInfo.imei = modem.getIMEI();
+      Serial.println(screenInfo.imei);
     }
-    if (postFailures >= maxPostFailures) {
-      Serial.println("post failures high, restarting loop");
-      break;
-    }
-  }
 
+    if (!modem.getGPS(&gpsLatitude, &gpsLongitude, &gpsSpeed, &gpsAltitude, &vsat, &usat, &gpsAccuracy, 
+                      &nowYear, &nowMonth, &nowDay, &nowHour, &nowMinute, &nowSecond)) {
+      Serial.print(F("awaiting lock, ms:"));
+      Serial.println(millis());
+      screenInfo.hasGPS = false;
+      continue;
+    }
+
+    if (gpsLatitude == 0 && gpsLongitude == 0) {
+      Serial.println(F("lat/long 0/0, that's some bulls..."));
+      continue;
+    }
+    
+    screenInfo.hasGPS = true;
+    Serial.println("lat/long = " + String(gpsLatitude, 6) + "/" + String(gpsLongitude, 6));
+
+    // ex:
+    // $$357207059646786,4003,2015/05/19,15:55:27,-20.21421,-70.14920  , 33.6, 0.4,  0.0, 11, 0.8, 12.9, 31,297, 1, 0, 0.0 ,0.0,0,1,1,1##
+    
+    // from:
+    //    https://github.com/traccar/traccar/blob/a8a06ffd494fc7161ca0edca39ae35be865a383f/src/main/java/org/traccar/protocol/XirgoProtocolDecoder.java#L53
+    //
+    // private static final Pattern PATTERN_OLD = new PatternBuilder()
+    //         .text("$$")
+    //         .number("(d+),")                     // imei
+    //         .number("(d+),")                     // event
+    //         .number("(dddd)/(dd)/(dd),")         // date (yyyy/mm/dd)
+    //         .number("(dd):(dd):(dd),")           // time (hh:mm:ss)
+    //         .number("(-?d+.?d*),")               // latitude
+    //         .number("(-?d+.?d*),")               // longitude
+    //         .number("(-?d+.?d*),")               // altitude
+    //         .number("(d+.?d*),")                 // speed
+    //         .number("(d+.?d*),")                 // course
+    //         .number("(d+),")                     // satellites
+    //         .number("(d+.?d*),")                 // hdop
+    //         .number("(d+.d+),")                  // battery
+    //         .number("(d+),")                     // gsm
+    //         .number("(d+.?d*),")                 // odometer
+    //         .number("(d+),")                     // gps
+    //         .any()
+    //         .compile();
+
+    // $$123456789012345,4002,2023/07/03,03:10:37,37.534069,-122.285416,5.80,0.00,0,9,0,0,0,0,1##
+
+    String data = "$$" + String(screenInfo.imei)
+                + "," + String("4001")
+                + "," + pad(nowYear) + "/"+ pad(nowMonth) + "/" + pad(nowDay)
+                + "," + pad(nowHour) + ":"+ pad(nowMinute) + ":" + pad(nowSecond)
+                + "," + String(gpsLatitude, 6)
+                + "," + String(gpsLongitude, 6)
+                + "," + String(gpsAltitude, 2)
+                + "," + String(gpsSpeed, 2)
+                + "," + String("0.0") // course?!?
+                + "," + String(usat) // sats
+                + "," + String("0.0") // hdop
+                + "," + String("0.0") // battery (NOTE: *must* have decimal place)
+                + "," + String("1") // gsm/rssi
+                + "," + String("0") // odometer (mi)
+                + "," + String("1") // gps (isvalid == 1)
+                + ",0##"; // the pattern match will junk anything after the GPS valid flag, but it REQUIRES the comma to be there
+
+    if (!client.connected()) {
+      if (!client.connect(traccar_server, traccar_port, 5)) {
+        Serial.println("Failed to TCP connect");
+        screenInfo.hasTCP = false;
+        continue; // try again in a moment 
+      } else {
+        Serial.println("TCP connected");
+      }
+    } else {
+      Serial.println("TCP still connected");
+    }
+    screenInfo.hasTCP = true;
+
+    Serial.println("Sending TCP data:");
+    Serial.println(data);
+    client.print(data);
+    Serial.println("...sent");
+
+    screenInfo.submissionCount++; 
+    screenInfo.lastLat = gpsLatitude;
+    screenInfo.lastLon = gpsLongitude;
+    screenInfo.lastTime = pad(nowYear) + "/"+ pad(nowMonth) + "/" + pad(nowDay)
+                  + " " + pad(nowHour) + ":"+ pad(nowMinute) + ":" + pad(nowSecond);
+
+  }
+  
 }
